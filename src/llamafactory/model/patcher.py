@@ -49,6 +49,104 @@ if is_transformers_version_greater_than("4.57.0"):
 
 logger = logging.get_logger(__name__)
 
+#Enes new 
+def patch_causal_lm_loss_with_flash_ce(model: "PreTrainedModel") -> None:
+    """
+    Monkey-patch model.loss_function to use flash-attn CrossEntropyLoss when available.
+    Falls back to the original HF loss function for full compatibility.
+    """
+    if not hasattr(model, "loss_function"):
+        return
+
+    original_loss_function = model.loss_function
+
+    try:
+        from flash_attn.losses.cross_entropy import CrossEntropyLoss as FlashCrossEntropyLoss
+    except Exception:
+        logger.info_rank0("flash-attn CrossEntropyLoss not available, using original HF loss.")
+        return
+
+    def _patched_loss_function(
+        logits,
+        labels,
+        vocab_size: int,
+        num_items_in_batch=None,
+        ignore_index: int = -100,
+        shift_labels=None,
+        **kwargs,
+    ):
+        # Keep compatibility for extra kwargs used by HF / custom trainers.
+        # We only consume kwargs that we can map safely.
+        hf_kwargs = dict(kwargs)
+        hf_kwargs.pop("process_group", None)    
+        allowed = {"process_group", "label_smoothing"}
+        flash_kwargs = {k: v for k, v in kwargs.items() if k in allowed}
+        unsupported = set(kwargs) - allowed
+
+        if unsupported:
+            return original_loss_function(
+                logits,
+                labels,
+                vocab_size=vocab_size,
+                num_items_in_batch=num_items_in_batch,
+                ignore_index=ignore_index,
+                shift_labels=shift_labels,
+                **hf_kwargs,
+            )
+
+        # Match HF shift behavior exactly.
+        if shift_labels is None:
+            labels = torch.nn.functional.pad(labels, (0, 1), value=ignore_index)
+            shift_labels = labels[..., 1:].contiguous()
+
+        source = logits.view(-1, vocab_size)
+        target = shift_labels.view(-1).to(source.device)
+
+        # flash-attn CE is CUDA-only; fallback for CPU / unsupported paths.
+        if not (source.is_cuda and target.is_cuda):
+            return original_loss_function(
+                logits,
+                labels,
+                vocab_size=vocab_size,
+                num_items_in_batch=num_items_in_batch,
+                ignore_index=ignore_index,
+                shift_labels=shift_labels,
+                **hf_kwargs,
+            )
+
+        reduction = "sum" if num_items_in_batch is not None else "mean"
+        try:
+            # Avoid logits.float() here to preserve flash-attn efficiency.
+            loss = FlashCrossEntropyLoss(
+                ignore_index=ignore_index,
+                reduction=reduction,
+                **flash_kwargs,
+            )(source, target)
+        except Exception:
+            # Any runtime incompatibility should preserve original HF behavior.
+            return original_loss_function(
+                logits,
+                labels,
+                vocab_size=vocab_size,
+                num_items_in_batch=num_items_in_batch,
+                ignore_index=ignore_index,
+                shift_labels=shift_labels,
+                **hf_kwargs,
+            )
+
+        # Match HF fixed_cross_entropy semantics for num_items_in_batch.
+        if reduction == "sum":
+            # Just in case users pass an int for num_items_in_batch.
+            if torch.is_tensor(num_items_in_batch):
+                num_items_in_batch = num_items_in_batch.to(loss.device)
+            loss = loss / num_items_in_batch
+
+        return loss
+
+    model.loss_function = _patched_loss_function
+    logger.info_rank0("Patched model.loss_function to use flash-attn CE when available.")
+
+#Enes end
 
 def patch_qwen3_omni_moe_thinker_text_sparse_moe_block():
     if is_transformers_version_greater_than("4.57.0") and not is_transformers_version_greater_than("4.58.0"):
@@ -233,6 +331,13 @@ def patch_model(
         prepare_model_for_training(model, model_args)
         autocast_projector_dtype(model, model_args)
         add_z3_leaf_module(model)
+
+        #Enes new
+        # Use flash-attn CE for causal LM loss if available; fallback keeps HF behavior.
+        model_type = getattr(model.config, "model_type", None) or ""
+        if ("qwen2_5_omni" in model_type) or ("qwen3_omni" in model_type):
+            patch_causal_lm_loss_with_flash_ce(model)
+        #Enes end
 
     if not model_args.use_unsloth:
         print_attn_implementation(model.config)
