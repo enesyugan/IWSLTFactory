@@ -123,7 +123,7 @@ def split_dataset(
             for name, data in eval_dataset.items():
                 eval_dict[f"validation_{name}"] = data
         else:
-            if data_args.streaming:
+            if data_args.eval_streaming:
                 eval_dataset = eval_dataset.shuffle(buffer_size=data_args.buffer_size, seed=seed)
 
             eval_dict["validation"] = eval_dataset

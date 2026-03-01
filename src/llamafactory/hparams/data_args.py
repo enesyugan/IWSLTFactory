@@ -59,6 +59,10 @@ class DataArguments:
         default=False,
         metadata={"help": "Enable dataset streaming."},
     )
+    eval_streaming: bool | None = field(
+        default=None,
+        metadata={"help": "Enable eval dataset streaming. Defaults to `streaming` when unset."},
+    )
     buffer_size: int = field(
         default=16384,
         metadata={"help": "Size of the buffer to randomly sample examples from in dataset streaming."},
@@ -166,13 +170,21 @@ class DataArguments:
             if self.dataset is not None and len(self.dataset) != len(self.interleave_probs):
                 raise ValueError("The length of dataset and interleave probs should be identical.")
 
-            if self.eval_dataset is not None and len(self.eval_dataset) != len(self.interleave_probs):
+            #Enes old
+            #if self.eval_dataset is not None and len(self.eval_dataset) != len(self.interleave_probs):
+            #Enes end
+            #Enes new
+            if self.eval_dataset is not None and len(self.eval_dataset) > 1 and len(self.eval_dataset) != len(self.interleave_probs):
+            #Enes old
                 raise ValueError("The length of eval dataset and interleave probs should be identical.")
+
+        if self.eval_streaming is None:
+            self.eval_streaming = self.streaming
 
         if self.streaming and self.val_size > 1e-6 and self.val_size < 1:
             raise ValueError("Streaming mode should have an integer val size.")
 
-        if self.streaming and self.max_samples is not None:
+        if (self.streaming or self.eval_streaming) and self.max_samples is not None:
             raise ValueError("`max_samples` is incompatible with `streaming`.")
 
         if self.mask_history and self.train_on_prompt:
