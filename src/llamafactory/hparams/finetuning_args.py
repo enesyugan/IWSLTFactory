@@ -530,12 +530,57 @@ class FinetuningArguments(
         default=False,
         metadata={"help": "Whether or not to compute effective tokens per second."},
     )
+    macro_eval_exclude_datasets: str | None = field(
+        default=None,
+        metadata={
+            "help": (
+                "Comma-separated eval dataset names to exclude from the macro eval loss. "
+                "Example: run8_dev"
+            )
+        },
+    )
+    macro_eval_baselines: str | None = field(
+        default=None,
+        metadata={
+            "help": (
+                "Comma-separated dataset=baseline pairs for normalized macro eval loss. "
+                "Example: run8_asr_dev=2.31,run8_sqa_dev=1.44"
+            )
+        },
+    )
 
     def __post_init__(self):
         def split_arg(arg):
             if isinstance(arg, str):
                 return [item.strip() for item in arg.split(",")]
             return arg
+
+        def parse_macro_eval_baselines(arg):
+            if arg is None:
+                return None
+            if isinstance(arg, dict):
+                return arg
+
+            baselines = {}
+            for item in split_arg(arg):
+                if "=" not in item:
+                    raise ValueError(
+                        "`macro_eval_baselines` must be in the format "
+                        "`dataset1=value1,dataset2=value2`."
+                    )
+
+                name, value = item.split("=", 1)
+                name = name.strip()
+                value = value.strip()
+
+                if not name:
+                    raise ValueError("Empty dataset name found in `macro_eval_baselines`.")
+                if not value:
+                    raise ValueError(f"Empty baseline value for dataset `{name}`.")
+
+                baselines[name] = float(value)
+
+            return baselines
 
         self.freeze_trainable_modules: list[str] = split_arg(self.freeze_trainable_modules)
         self.freeze_extra_modules: list[str] | None = split_arg(self.freeze_extra_modules)
@@ -546,6 +591,9 @@ class FinetuningArguments(
         self.galore_target: list[str] = split_arg(self.galore_target)
         self.apollo_target: list[str] = split_arg(self.apollo_target)
         self.use_ref_model = self.stage == "dpo" and self.pref_loss not in ["orpo", "simpo"]
+        self.macro_eval_exclude_datasets: list[str] | None = split_arg(self.macro_eval_exclude_datasets)
+        self.macro_eval_baselines: dict[str, float] | None = parse_macro_eval_baselines(self.macro_eval_baselines)
+
 
         assert self.finetuning_type in ["lora", "oft", "freeze", "full"], "Invalid fine-tuning method."
         assert self.ref_model_quantization_bit in [None, 8, 4], "We only accept 4-bit or 8-bit quantization."

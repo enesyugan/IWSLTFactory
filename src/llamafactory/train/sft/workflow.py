@@ -147,6 +147,7 @@ def run_sft(
                 keys += sum(
                     [[f"eval_{key}_loss", f"eval_{key}_accuracy"] for key in dataset_module["eval_dataset"].keys()], []
                 )
+                keys += ["eval_macro_dev_loss", "eval_normalized_macro_loss"]
             else:
                 keys += ["eval_loss", "eval_accuracy"]
 

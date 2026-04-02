@@ -18,7 +18,7 @@
 import json
 import os
 from types import MethodType
-from typing import TYPE_CHECKING, Any, Optional, Union
+from typing import TYPE_CHECKING, Any, Optional, Union, Callable
 
 import numpy as np
 import torch
@@ -30,6 +30,13 @@ from ...extras.constants import IGNORE_INDEX
 from ..callbacks import SaveProcessorCallback
 from ..fp8_utils import configure_fp8_environment, patch_accelerator_for_fp8, verify_fp8_status
 from ..trainer_utils import create_custom_optimizer, create_custom_scheduler
+
+from functools import partial
+import datasets
+from torch.utils.data import DataLoader
+from transformers.trainer_utils import seed_worker
+from transformers.utils import is_datasets_available
+from tqdm.auto import tqdm
 
 
 if TYPE_CHECKING:
@@ -110,6 +117,153 @@ class CustomSeq2SeqTrainer(Seq2SeqTrainer):
         create_custom_scheduler(self.args, num_training_steps, optimizer)
         return super().create_scheduler(num_training_steps, optimizer)
 
+    @override
+    def evaluate(
+        self,
+        eval_dataset=None,
+        ignore_keys=None,
+        metric_key_prefix: str = "eval",
+        **gen_kwargs,
+    ):
+        if (
+            gen_kwargs.get("max_length") is None
+            and gen_kwargs.get("max_new_tokens") is None
+            and self.args.generation_max_length is not None
+        ):
+            gen_kwargs["max_length"] = self.args.generation_max_length
+
+        if gen_kwargs.get("num_beams") is None and self.args.generation_num_beams is not None:
+            gen_kwargs["num_beams"] = self.args.generation_num_beams
+
+        self.gather_function = self.accelerator.gather
+        self._gen_kwargs = gen_kwargs
+
+        override = eval_dataset is not None
+        eval_dataset = eval_dataset if override else self.eval_dataset
+
+        if isinstance(eval_dataset, dict):
+            metrics = {}
+            exclude_names = set(self.finetuning_args.macro_eval_exclude_datasets or [])
+            baseline_map = self.finetuning_args.macro_eval_baselines or {}
+            require_normalized_baselines = self.args.metric_for_best_model == "eval_normalized_macro_loss"
+
+            macro_values = []
+            normalized_macro_values = []
+
+            for eval_dataset_name, _eval_dataset in eval_dataset.items():
+                if eval_dataset_name in exclude_names:
+                    continue
+
+                dataset_metrics = self.evaluate(
+                    eval_dataset=_eval_dataset if override else eval_dataset_name,
+                    ignore_keys=ignore_keys,
+                    metric_key_prefix=f"{metric_key_prefix}_{eval_dataset_name}",
+                )
+                metrics.update(dataset_metrics)
+
+
+                loss_key = f"{metric_key_prefix}_{eval_dataset_name}_loss"
+                if loss_key not in dataset_metrics:
+                    logger.warning_rank0(
+                        f"Expected eval metric `{loss_key}` for dataset `{eval_dataset_name}` was not found. "
+                        f"Available metric keys: {sorted(dataset_metrics.keys())}"
+                    )
+                    continue
+
+                loss = dataset_metrics[loss_key]
+                macro_values.append(loss)
+
+                baseline = baseline_map.get(eval_dataset_name)
+                #if baseline is not None:
+                if baseline is None:
+                    if require_normalized_baselines:
+                        raise ValueError(
+                            f"No baseline configured for dataset `{eval_dataset_name}` in `macro_eval_baselines`."
+                        )
+                else:
+                    if baseline == 0:
+                        raise ValueError(
+                            f"`macro_eval_baselines` contains zero for dataset `{eval_dataset_name}`, "
+                            "cannot divide by zero."
+                        )
+                    normalized_macro_values.append(loss / baseline)
+
+            if macro_values:
+                metrics[f"{metric_key_prefix}_macro_dev_loss"] = sum(macro_values) / len(macro_values)
+
+            if normalized_macro_values:
+                metrics[f"{metric_key_prefix}_normalized_macro_loss"] = (
+                    sum(normalized_macro_values) / len(normalized_macro_values)
+                )
+
+
+            self.log(metrics)
+            self.control = self.callback_handler.on_evaluate(self.args, self.state, self.control, metrics)
+
+            return metrics
+
+        return super().evaluate(
+            eval_dataset=eval_dataset,
+            ignore_keys=ignore_keys,
+            metric_key_prefix=metric_key_prefix,
+        )
+
+
+    @override
+    def _get_dataloader(
+        self,
+        dataset,
+        description: str,
+        batch_size: int,
+        sampler_fn: Optional[Callable] = None,
+        is_training: bool = False,
+        dataloader_key: Optional[str] = None,
+    ) -> DataLoader:
+        if self.is_world_process_zero():  # only rank0 to avoid spam
+            tqdm.write(
+                f"[dbg] step={self.state.global_step} enter _get_dataloader "
+                f"desc={description} iterable={isinstance(dataset, torch.utils.data.IterableDataset)} "
+                f"drop_last={self.args.dataloader_drop_last} "
+                f"prefetch={self.args.dataloader_prefetch_factor} "
+                f"workers={self.args.dataloader_num_workers} rank={os.getenv('RANK','?')}"
+            )
+        data_collator = self.data_collator
+        if is_datasets_available() and isinstance(dataset, datasets.Dataset):
+            dataset = self._remove_unused_columns(dataset, description=description)
+        else:
+            data_collator = self._get_collator_with_removed_columns(self.data_collator, description=description)
+    
+        dataloader_params = {
+            "batch_size": batch_size,
+            "collate_fn": data_collator,
+            "num_workers": self.args.dataloader_num_workers,
+            "pin_memory": self.args.dataloader_pin_memory,
+            "persistent_workers": self.args.dataloader_persistent_workers,
+            "drop_last": self.args.dataloader_drop_last,  # now also for iterable datasets
+        }
+    
+        # prefetch_factor only valid when num_workers > 0
+        if self.args.dataloader_num_workers > 0 and self.args.dataloader_prefetch_factor is not None:
+            dataloader_params["prefetch_factor"] = self.args.dataloader_prefetch_factor
+    
+        if not isinstance(dataset, torch.utils.data.IterableDataset):
+            if sampler_fn is not None:
+                dataloader_params["sampler"] = sampler_fn(dataset)
+            if is_training:
+                dataloader_params["worker_init_fn"] = partial(
+                    seed_worker, num_workers=self.args.dataloader_num_workers, rank=self.args.process_index
+                )
+    
+        dataloader = self.accelerator.prepare(DataLoader(dataset, **dataloader_params))
+
+        if dataloader_key is not None and self.args.dataloader_persistent_workers:
+            if hasattr(self, "_eval_dataloaders"):
+                self._eval_dataloaders[dataloader_key] = dataloader
+            else:
+                self._eval_dataloaders = {dataloader_key: dataloader}
+
+        return dataloader
+    
     @override
     def _get_train_sampler(self, *args, **kwargs) -> Optional["torch.utils.data.Sampler"]:
         if self.finetuning_args.disable_shuffling:
