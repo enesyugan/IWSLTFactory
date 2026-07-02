@@ -13,6 +13,10 @@
 [![WeChat](https://img.shields.io/badge/WeChat-User%20Group-blue?logo=wechat)](https://github.com/hiyouga/llamafactory-community)
 [![Blog](https://img.shields.io/badge/Hugo-Official%20Blog-blue?logo=hugo)](https://blog.llamafactory.net/en/)
 
+> [!IMPORTANT]
+> This repository contains submissions to the IWSLT Instruction Following Track 2026 and the BeTraC 2026 challenge.
+> The IWSLT submission is described in [Multilingual Long-Form Speech Instruction Following: KIT's Submission to IWSLT 2026](https://arxiv.org/abs/2606.04730).
+
 [![Open in Colab](assets/thirdparty/colab.svg)](https://colab.research.google.com/drive/1eRTPn37ltBbYsISy9Aw2NuI2Aq5CQrD9?usp=sharing)
 [![Open in DSW](assets/thirdparty/dsw.svg)](https://gallery.pai-ml.com/#/preview/deepLearning/nlp/llama_factory)
 [![Open in Lab4ai](assets/thirdparty/lab4ai.svg)](https://www.lab4ai.cn/course/detail?id=7c13e60f6137474eb40f6fd3983c0f46&utm_source=LLaMA-Factory)
