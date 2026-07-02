@@ -99,12 +99,14 @@ def load_tokenizer(model_args: "ModelArguments") -> "TokenizerModule":
         processor = AutoProcessor.from_pretrained(
             model_args.model_name_or_path,
             use_fast=model_args.use_fast_tokenizer,
+            truncation=False,  # Enes: keep complete audio inputs
             **init_kwargs,
         )
     except ValueError:  # try another one
         processor = AutoProcessor.from_pretrained(
             model_args.model_name_or_path,
             use_fast=not model_args.use_fast_tokenizer,
+            truncation=False,  # Enes: keep complete audio inputs
             **init_kwargs,
         )
     except Exception as e:
@@ -118,6 +120,10 @@ def load_tokenizer(model_args: "ModelArguments") -> "TokenizerModule":
         processor = None
 
     if processor is not None:
+        logger.info_rank0(
+            f"Loaded processor {processor.__class__.__name__} with truncation=False. "
+            "Qwen2-Omni audio feature extraction uses padding=longest and truncation=False at call time."
+        )
         patch_processor(processor, tokenizer, model_args)
 
     return {"tokenizer": tokenizer, "processor": processor}

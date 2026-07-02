@@ -35,7 +35,26 @@ from transformers.models.mllama.processing_mllama import (
 from typing_extensions import override
 
 from ..extras.constants import AUDIO_PLACEHOLDER, IGNORE_INDEX, IMAGE_PLACEHOLDER, VIDEO_PLACEHOLDER
+from ..extras.logging import get_logger
 from ..extras.packages import is_pillow_available, is_pyav_available, is_transformers_version_greater_than
+
+
+logger = get_logger(__name__)
+
+
+def _claim_full_audio_audit_log() -> bool:
+    r"""Allow one successful full-audio audit log per rank-0 parent process."""
+    if int(os.getenv("LOCAL_RANK", "0")) != 0:
+        return False
+
+    marker_path = f"/tmp/llamafactory_full_audio_audit_{os.getppid()}"
+    try:
+        marker_fd = os.open(marker_path, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+    except FileExistsError:
+        return False
+
+    os.close(marker_fd)
+    return True
 
 
 if is_pillow_available():
@@ -1901,19 +1920,43 @@ class Qwen2OmniPlugin(Qwen2VLPlugin):
             )
 
         if len(audios) != 0:
+            sampling_rate = getattr(processor, "audio_sampling_rate", 16000)
             audios = self._regularize_audios(
                 audios,
-                sampling_rate=getattr(processor, "audio_sampling_rate", 16000),
+                sampling_rate=sampling_rate,
             )["audios"]
             mm_inputs.update(
                 feature_extractor(
                     audios,
-                    sampling_rate=getattr(processor, "audio_sampling_rate", 16000),
+                    sampling_rate=sampling_rate,
                     return_attention_mask=True,
-                    padding="max_length",
+                    padding="longest",
+                    truncation=False,
                     return_tensors="pt",
                 )
             )
+            original_samples = torch.tensor([len(audio) for audio in audios])
+            expected_frames = (original_samples + feature_extractor.hop_length - 1) // feature_extractor.hop_length
+            processed_frames = mm_inputs["attention_mask"].sum(-1).cpu()
+            configured_max_samples = getattr(feature_extractor, "n_samples", 0)
+            over_limit = original_samples > configured_max_samples
+            if over_limit.any():
+                missing_frames = torch.clamp(expected_frames - processed_frames, min=0)
+                status = "FULL" if torch.all(missing_frames <= 2) else "TRUNCATED"
+                log_audio_audit = logger.warning_rank0 if status == "TRUNCATED" else logger.info_rank0
+                if status == "TRUNCATED" or _claim_full_audio_audit_log():
+                    log_audio_audit(
+                        "[audio truncation audit] status=%s, over_configured_limit=%d/%d, "
+                        "max_original_seconds=%.2f, max_processed_seconds=%.2f, max_boundary_difference_seconds=%.3f, "
+                        "configured_limit_seconds=%.2f",
+                        status,
+                        over_limit.sum().item(),
+                        len(audios),
+                        original_samples.max().item() / sampling_rate,
+                        processed_frames.max().item() * feature_extractor.hop_length / sampling_rate,
+                        missing_frames.max().item() * feature_extractor.hop_length / sampling_rate,
+                        configured_max_samples / sampling_rate,
+                    )
             mm_inputs["feature_attention_mask"] = mm_inputs.pop("attention_mask")  # prevent conflicts
 
         return mm_inputs
