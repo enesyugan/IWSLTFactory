@@ -49,7 +49,6 @@ if is_transformers_version_greater_than("4.57.0"):
 
 logger = logging.get_logger(__name__)
 
-#Enes new 
 def patch_causal_lm_loss_with_flash_ce(model: "PreTrainedModel") -> None:
     """
     Monkey-patch model.loss_function to use flash-attn CrossEntropyLoss when available.
