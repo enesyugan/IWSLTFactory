@@ -13,13 +13,12 @@
 # limitations under the License.
 
 from collections import defaultdict
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any, Optional
 
 from ...extras import logging
 from ...extras.constants import IGNORE_INDEX
 from .processor_utils import DatasetProcessor, greedy_knapsack, infer_seqlen
-
 
 if TYPE_CHECKING:
     from ..mm_plugin import AudioInput, ImageInput, VideoInput
@@ -30,6 +29,32 @@ logger = logging.get_logger(__name__)
 
 @dataclass
 class SupervisedDatasetProcessor(DatasetProcessor):
+    truncation_log_interval: int = 500
+    num_encoded_examples: int = field(default=0, init=False)
+    num_truncated_examples: int = field(default=0, init=False)
+    num_truncated_tokens: int = field(default=0, init=False)
+
+    def _log_global_truncation_stats(self) -> None:
+        if self.truncation_log_interval <= 0:
+            return
+        if self.num_encoded_examples == 0 or self.num_encoded_examples % self.truncation_log_interval != 0:
+            return
+
+        # Local-only stats (safe in forked dataset.map workers; no CUDA/distributed calls).
+        global_encoded = self.num_encoded_examples
+        global_truncated = self.num_truncated_examples
+        global_removed = self.num_truncated_tokens
+        trunc_pct = 100.0 * global_truncated / max(1, global_encoded)
+        avg_removed = global_removed / max(1, global_truncated)
+
+        logger.info_rank0(
+            f"[cutoff_len={self.data_args.cutoff_len}] "
+            f"global_processed={global_encoded}, "
+            f"global_truncated_examples={global_truncated} ({trunc_pct:.2f}%), "
+            f"global_truncated_tokens={global_removed}, "
+            f"global_avg_removed_tokens_per_truncated_example={avg_removed:.1f}"
+        )
+
     def _encode_data_example(
         self,
         prompt: list[dict[str, str]],
@@ -46,6 +71,8 @@ class SupervisedDatasetProcessor(DatasetProcessor):
         )
         encoded_pairs = self.template.encode_multiturn(self.tokenizer, messages, system, tools)
         total_length = len(input_ids) + (1 if self.template.efficient_eos else 0)
+        truncated_tokens_in_example = 0
+
         if self.data_args.mask_history:
             encoded_pairs = encoded_pairs[::-1]  # high priority for last turns
 
@@ -53,9 +80,13 @@ class SupervisedDatasetProcessor(DatasetProcessor):
             if total_length >= self.data_args.cutoff_len:
                 break
 
+            orig_source_len = len(source_ids)
+            orig_target_len = len(target_ids)
+
             source_len, target_len = infer_seqlen(
                 len(source_ids), len(target_ids), self.data_args.cutoff_len - total_length
             )
+            truncated_tokens_in_example += (orig_source_len - source_len) + (orig_target_len - target_len)
             source_ids = source_ids[:source_len]
             target_ids = target_ids[:target_len]
             total_length += source_len + target_len
@@ -82,6 +113,12 @@ class SupervisedDatasetProcessor(DatasetProcessor):
         if self.template.efficient_eos:
             input_ids += [self.tokenizer.eos_token_id]
             labels += [self.tokenizer.eos_token_id]
+
+        self.num_encoded_examples += 1
+        if truncated_tokens_in_example > 0:
+            self.num_truncated_examples += 1
+            self.num_truncated_tokens += truncated_tokens_in_example
+        self._log_global_truncation_stats()
 
         return input_ids, labels
 
